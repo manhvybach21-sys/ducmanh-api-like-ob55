@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import asyncio
+import os
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 import binascii
@@ -30,19 +31,26 @@ used_count = 0
 
 
 def load_tokens(region):
+    # VN dùng chung token_br.json (đã có trong repo, khớp với code gốc)
+    token_files = {
+        "IND": "token_ind.json",
+        "BR": "token_br.json",
+        "US": "token_br.json",
+        "SAC": "token_br.json",
+        "NA": "token_br.json",
+        "VN": "token_br.json",
+    }
+    filename = token_files.get(region, "token_bd.json")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     try:
-        if region == "IND":
-            with open("token_ind.json", "r") as f:
-                tokens = json.load(f)
-        elif region in {"BR", "US", "SAC", "NA", "VN"}:
-            with open("token_br.json", "r") as f:
-                tokens = json.load(f)
-        else:
-            with open("token_bd.json", "r") as f:
-                tokens = json.load(f)
+        with open(os.path.join(base_dir, filename), "r", encoding="utf-8") as f:
+            tokens = json.load(f)
+        if not tokens:
+            app.logger.error(f"Token file {filename} is empty")
+            return None
         return tokens
     except Exception as e:
-        app.logger.error(f"Error loading tokens for region {region}: {e}")
+        app.logger.error(f"Error loading tokens for region {region} from {filename}: {e}")
         return None
 
 
@@ -133,13 +141,14 @@ def enc(uid):
 
 
 def make_request(encrypt, region, token):
+    """Trả về (Info, None) nếu thành công, hoặc (None, lý do lỗi)."""
+    if region == "IND":
+        url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+    elif region in {"BR", "US", "SAC", "NA"}:
+        url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+    else:
+        url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
     try:
-        if region == "IND":
-            url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-        elif region in {"BR", "US", "SAC", "NA"}:
-            url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-        else:
-            url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
         edata = bytes.fromhex(encrypt)
         headers = {
             "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -150,19 +159,21 @@ def make_request(encrypt, region, token):
             "Expect": "100-continue",
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB55"
+            "ReleaseVersion": "OB55",
         }
-        response = requests.post(url, data=edata, headers=headers, verify=False)
-        binary = response.content
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=15)
+        if response.status_code != 200:
+            body = response.content[:200].decode("utf-8", errors="replace")
+            return None, f"Server game trả HTTP {response.status_code}: {body}"
         decoded = visit_count_pb2.Info()
-        decoded.ParseFromString(binary)
-        return decoded
+        decoded.ParseFromString(response.content)
+        if not decoded.HasField("AccountInfo"):
+            return None, "Server trả dữ liệu rỗng (token, UID hoặc region có thể không khớp)"
+        return decoded, None
     except DecodeError as e:
-        app.logger.error(f"DecodeError: {e}")
-        return None
+        return None, f"Không giải mã được protobuf: {e}"
     except Exception as e:
-        app.logger.error(f"Error in make_request: {e}")
-        return None
+        return None, f"{type(e).__name__}: {e}"
 
 
 @app.route('/like', methods=['GET'])
@@ -198,9 +209,9 @@ def handle_requests():
             encrypted_uid = enc(uid)
             if encrypted_uid is None:
                 raise Exception("Encryption of UID failed.")
-            before = make_request(encrypted_uid, region, token)
+            before, err = make_request(encrypted_uid, region, token)
             if before is None:
-                raise Exception("Failed to get initial info.")
+                raise Exception(f"Failed to get initial info: {err}")
             before_like = before.AccountInfo.Likes
 
             if region == "IND":
@@ -212,9 +223,9 @@ def handle_requests():
 
             asyncio.run(send_multiple_requests(uid, region, url))
 
-            after = make_request(encrypted_uid, region, token)
+            after, err = make_request(encrypted_uid, region, token)
             if after is None:
-                raise Exception("Failed to get final info.")
+                raise Exception(f"Failed to get final info: {err}")
             after_like = after.AccountInfo.Likes
             like_given = after_like - before_like
             status = 1 if like_given > 0 else 2
